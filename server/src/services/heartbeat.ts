@@ -4102,6 +4102,27 @@ export function resolveTaskSessionConfigFreshness(input: {
   };
 }
 
+/**
+ * One-shot execution mode guard for wakeup suppression.
+ *
+ * Agents with `runtimeConfig.executionMode === "one_shot"` suppress all
+ * automatic wakes (recovery, retry, continuation, scheduled, periodic scan).
+ * Only user-requested on_demand wakes pass through, preserving the single
+ * manually-triggered run semantics.
+ *
+ * Returns `true` when the wake should be suppressed.
+ */
+export function shouldSuppressWakeupForOneShotMode(input: {
+  runtimeConfig: unknown;
+  requestedByActorType: "user" | "agent" | "system" | undefined;
+  source: string;
+}): boolean {
+  if (parseObject(input.runtimeConfig)?.executionMode !== "one_shot") return false;
+  if (input.requestedByActorType === "user") return false;
+  if (input.source === "on_demand") return false;
+  return true;
+}
+
 export function shouldAutoCheckoutIssueForWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   issueStatus: string | null;
@@ -7735,11 +7756,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           id: agents.id,
           companyId: agents.companyId,
           status: agents.status,
+          runtimeConfig: agents.runtimeConfig,
         })
         .from(agents)
         .where(eq(agents.id, run.agentId))
         .then((rows) => rows[0] ?? null),
     ]);
+
+    if (agent && parseObject(agent.runtimeConfig)?.executionMode === "one_shot") {
+        await setRunStatus(run.id, run.status, {
+            livenessReason: `${run.livenessReason ?? "Run ended without concrete progress"}; one-shot mode suppresses continuation`,
+        });
+        return;
+    }
 
     const budgetBlock =
       issue && agent
@@ -7908,6 +7937,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
     if (run.status !== "succeeded") return;
+    if (agent && parseObject(agent.runtimeConfig)?.executionMode === "one_shot") return;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
@@ -15189,6 +15219,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (schedulingSuppression.suppressed) {
       await writeSkippedHeartbeatRequest("heartbeat.scheduling_suppressed", {
         reason: schedulingSuppression.reason,
+      });
+      return null;
+    }
+
+    // One-shot execution mode guard: agents with runtimeConfig.executionMode
+    // === "one_shot" suppress all automatic wakes (recovery, retry, continuation,
+    // scheduled, periodic scan). Only user-requested on_demand wakes pass
+    // through, preserving the single manually-triggered run semantics.
+    if (shouldSuppressWakeupForOneShotMode({
+      runtimeConfig: agent.runtimeConfig,
+      requestedByActorType: opts.requestedByActorType,
+      source,
+    })) {
+      await writeSkippedRequest("one_shot_suppressed", {
+        payload: {
+          ...(payload ?? {}),
+          oneShotSuppressed: true,
+          suppressionReason: "one_shot_mode_blocks_automatic_wake",
+        },
       });
       return null;
     }
