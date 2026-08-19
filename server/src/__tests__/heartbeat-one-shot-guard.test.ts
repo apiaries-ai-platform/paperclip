@@ -34,12 +34,28 @@ describe("shouldSuppressWakeupForOneShotMode", () => {
     })).toBe(false);
   });
 
-  it("allows user-requested wakes regardless of source for one_shot agents", () => {
+  it("suppresses user-actor automation wakes for one_shot agents", () => {
     expect(shouldSuppressWakeupForOneShotMode({
       runtimeConfig: { executionMode: "one_shot" },
       requestedByActorType: "user",
       source: "automation",
-    })).toBe(false);
+    })).toBe(true);
+  });
+
+  it("suppresses user-actor assignment wakes for one_shot agents", () => {
+    expect(shouldSuppressWakeupForOneShotMode({
+      runtimeConfig: { executionMode: "one_shot" },
+      requestedByActorType: "user",
+      source: "assignment",
+    })).toBe(true);
+  });
+
+  it("suppresses user-actor timer wakes for one_shot agents", () => {
+    expect(shouldSuppressWakeupForOneShotMode({
+      runtimeConfig: { executionMode: "one_shot" },
+      requestedByActorType: "user",
+      source: "timer",
+    })).toBe(true);
   });
 
   it("allows on_demand wakes from non-user actors for one_shot agents", () => {

@@ -4118,7 +4118,6 @@ export function shouldSuppressWakeupForOneShotMode(input: {
   source: string;
 }): boolean {
   if (parseObject(input.runtimeConfig)?.executionMode !== "one_shot") return false;
-  if (input.requestedByActorType === "user") return false;
   if (input.source === "on_demand") return false;
   return true;
 }
@@ -14593,6 +14592,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
 
+        if (parseObject(deferredAgent.runtimeConfig)?.executionMode === "one_shot") {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "skipped",
+              finishedAt: new Date(),
+              error: "one_shot_mode_blocks_deferred_promotion",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         const deferredPayload = parseObject(deferred.payload);
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
         const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
@@ -14849,12 +14861,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
 
       if (issueNeedsReviewParticipantRecovery) {
-        const existingReviewParticipantExecutionPath = await findExistingExecutionPath(currentParticipant.agentId);
+        const reviewRecoveryAgentId = currentParticipant?.agentId;
+        const existingReviewParticipantExecutionPath = reviewRecoveryAgentId
+          ? await findExistingExecutionPath(reviewRecoveryAgentId)
+          : null;
+        const reviewRecoveryAgent = reviewRecoveryAgentId ? await getAgent(reviewRecoveryAgentId) : null;
         if (
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
           issueHasPersistedMonitor ||
-          await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
+          await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc) ||
+          (reviewRecoveryAgent && parseObject(reviewRecoveryAgent.runtimeConfig)?.executionMode === "one_shot")
         ) {
           return { kind: "released" as const };
         }
@@ -14968,6 +14985,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "released" as const };
       }
       if (options.suppressImmediateRecovery) {
+        return { kind: "released" as const };
+      }
+      if (recoveryAgent && parseObject(recoveryAgent.runtimeConfig)?.executionMode === "one_shot") {
         return { kind: "released" as const };
       }
 
@@ -15225,8 +15245,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     // One-shot execution mode guard: agents with runtimeConfig.executionMode
     // === "one_shot" suppress all automatic wakes (recovery, retry, continuation,
-    // scheduled, periodic scan). Only user-requested on_demand wakes pass
-    // through, preserving the single manually-triggered run semantics.
+    // scheduled, periodic scan, assignment, comment-triggered). Only explicit
+    // on_demand wakes pass through, preserving the single manually-triggered
+    // run semantics. User-actor automation wakes (e.g. comment-triggered) are
+    // suppressed because they are not manual on_demand wakes.
     if (shouldSuppressWakeupForOneShotMode({
       runtimeConfig: agent.runtimeConfig,
       requestedByActorType: opts.requestedByActorType,
